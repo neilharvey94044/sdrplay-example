@@ -30,7 +30,6 @@
 #include <windows.h>
 #include <io.h>
 #include <fcntl.h>
-#include "getopt/getopt.h"
 #include "mir_sdr.h"
 #endif
 
@@ -81,8 +80,9 @@ void usage(void)
 		"Usage:\t -f frequency_to_tune_to [Hz]\n"
 		"\t[-s samplerate (default: 2048000 Hz)]\n"
 		"\t[-g gain (default: 50)]\n"
-//		"\t[-b output_block_size (default: 16 * 16384)]\n"
 		"\t[-n number of samples to read (default: 0, infinite)]\n"
+        "\t[-R enable gain reduction (default: 0, disabled)]\n"
+        "\t[-L RSP LNA enable (default: 0, disabled)]\n"
 		"\tfilename (a '-' dumps samples to stdout)\n\n");
 	exit(1);
 }
@@ -94,7 +94,7 @@ sighandler(int signum)
 	if (CTRL_C_EVENT == signum) {
 		fprintf(stderr, "Signal caught, exiting!\n");
 		do_exit = 1;
-		rtlsdr_cancel_async(dev);
+		mir_sdr_Uninit();
 		return TRUE;
 	}
 	return FALSE;
@@ -108,28 +108,6 @@ static void sighandler(int signum)
 }
 #endif
 
-static void sdrplay_callback(unsigned char *buf, uint32_t len, void *ctx)
-{
-	if (ctx) {
-		if (do_exit)
-			return;
-
-		if ((bytes_to_read > 0) && (bytes_to_read < len)) {
-			len = bytes_to_read;
-			do_exit = 1;
-			mir_sdr_Uninit();
-		}
-
-		if (fwrite(buf, 1, len, (FILE*)ctx) != len) {
-			fprintf(stderr, "Short write, samples lost, exiting!\n");
-			mir_sdr_Uninit();
-		}
-
-		if (bytes_to_read > 0)
-			bytes_to_read -= len;
-	}
-}
-
 int main(int argc, char **argv)
 {
 #ifndef _WIN32
@@ -140,18 +118,16 @@ int main(int argc, char **argv)
 	mir_sdr_ErrT r;
     int opt;
 	int gain = 50;
-	int ppm_error = 0;
-	int sync_mode = 0;
 	FILE *file;
 	uint8_t *buffer;
-	int dev_index = 0;
-	int dev_given = 0;
 	uint32_t frequency = 100000000;
 	uint32_t samp_rate = DEFAULT_SAMPLE_RATE;
 	uint32_t out_block_size = DEFAULT_BUF_LENGTH;
+    int rspMode = 0;
+    int rspLNA = 0;
     int i, j;
 
-	while ((opt = getopt(argc, argv, "d:f:g:s:b:n:p:S")) != -1) {
+	while ((opt = getopt(argc, argv, "f:g:s:n:r:l")) != -1) {
 		switch (opt) {
 		case 'f':
 			frequency = (uint32_t)atofs(optarg);
@@ -162,12 +138,15 @@ int main(int argc, char **argv)
 		case 's':
 			samp_rate = (uint32_t)atofs(optarg);
 			break;
-//		case 'b':
-//			out_block_size = (uint32_t)atof(optarg);
-//			break;
 		case 'n':
 			bytes_to_read = (uint32_t)atofs(optarg) * 2;
 			break;
+        case 'r':
+            rspMode = atoi(optarg);
+            break;
+        case 'l':
+            rspLNA = atoi(optarg);
+            break;
 		default:
 			usage();
 			break;
@@ -225,8 +204,30 @@ int main(int argc, char **argv)
 		}
 	}
 
-    r = mir_sdr_Init((78-gain), (samp_rate/1e6), (frequency/1e6),
+    if (rspMode == 1)
+    {
+        mir_sdr_SetParam(201,1);
+        if (rspLNA == 1)
+        {
+            mir_sdr_SetParam(202,0);
+        }
+        else
+        {
+            mir_sdr_SetParam(202,1);
+        }
+        r = mir_sdr_Init(gain, (samp_rate/1e6), (frequency/1e6),
                        mir_sdr_BW_1_536, mir_sdr_IF_Zero, &samplesPerPacket );
+    }
+    else
+    {
+        r = mir_sdr_Init((78-gain), (samp_rate/1e6), (frequency/1e6),
+                       mir_sdr_BW_1_536, mir_sdr_IF_Zero, &samplesPerPacket );
+    }
+
+	if (r != mir_sdr_Success) {
+		fprintf(stderr, "Failed to start SDRplay RSP device.\n");
+		exit(1);
+	}
 
     mir_sdr_SetDcMode(4,0);
     mir_sdr_SetDcTrackTime(63);
