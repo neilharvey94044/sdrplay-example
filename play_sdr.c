@@ -447,6 +447,8 @@ int main(int argc, char **argv)
 
 	mir_sdr_StreamUninit();
 
+    mir_sdr_ReleaseDeviceIdx();
+
     if (outputRes == 16) {
 	    free (buf16);
     } else {
