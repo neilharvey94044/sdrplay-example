@@ -1,4 +1,6 @@
 /*
+ * play_sdr, an update to work with SDRplay RSP devices
+ *
  * rtl-sdr, turns your Realtek RTL2832 based DVB dongle into a SDR receiver
  * Copyright (C) 2012 by Steve Markgraf <steve@steve-m.de>
  *
@@ -24,6 +26,7 @@
 #include <stdlib.h>
 
 #ifndef _WIN32
+#include <stdbool.h>
 #include <unistd.h>
 #include "mirsdrapi-rsp.h"
 #else
@@ -33,18 +36,22 @@
 #include "mir_sdr.h"
 #endif
 
-#define DEFAULT_SAMPLE_RATE		2048000
+#define DEFAULT_SAMPLE_RATE		2000000
 #define DEFAULT_BUF_LENGTH		(336 * 2) // (16 * 16384)
 #define MINIMAL_BUF_LENGTH		672 // 512
 #define MAXIMAL_BUF_LENGTH		(256 * 16384)
 
 static int do_exit = 0;
-static uint32_t bytes_to_read = 0;
 
-short *ibuf;
-short *qbuf;
+void *cbContext = NULL;
+
+FILE *file;
+uint8_t *buf8;
+short *buf16;
 unsigned int firstSample;
 int samplesPerPacket, grChanged, fsChanged, rfChanged;
+int devModel = 1;
+int outputRes = 16;
 
 double atofs(char *s)
 /* standard suffixes */
@@ -77,13 +84,24 @@ void usage(void)
 {
 	fprintf(stderr,
 		"play_sdr, an I/Q recorder for SDRplay RSP receivers\n\n"
-		"Usage:\t -f frequency_to_tune_to [Hz]\n"
-		"\t[-s samplerate (default: 2048000 Hz)]\n"
-		"\t[-g gain (default: 50)]\n"
-		"\t[-n number of samples to read (default: 0, infinite)]\n"
-        "\t[-R enable gain reduction (default: 0, disabled)]\n"
-        "\t[-L RSP LNA enable (default: 0, disabled)]\n"
-		"\tfilename (a '-' dumps samples to stdout)\n\n");
+		"Usage:\t[-f frequency_to_tune_to [Hz]\n"
+        "\t[-d RSP device to use (default: 1, first found)]\n"
+		"\t[-s samplerate (default: 2000000 Hz)]\n"
+		"\t[-R gain reduction (default: 50)]\n"
+        "\t[-l RSP LNA (default: 0, disabled)]\n"
+        "\t[-b Bandwidth in kHz (default: 1536)]\n"
+        "\t[-i IF bandwidth in kHz (default: 0)]\n"
+        "\t[-p ADC set point in dBfs (default: -30)]\n"
+        "\t[-n Broadcast Notch enable* (default: 0, disabled)]\n"
+        "\t[-r Refclk output enable* (default: 0, disabled)]\n"
+        "\t[-t Bias-T enable* (default: 0, disabled)]\n"
+        "\t[-a Antenna select* (0/1/2, default: 0, Port A)]\n"
+        "\t[-o PPM offset (default 0.0)]\n"
+        "\t[-A IF AGC enable (default: 1, enabled)]\n"
+        "\t[-x Output bitresolution (8/16, default: 16)]\n"
+        "\t[-v Verbose output (debug) enable (default: 0, disabled)]\n\n"
+		"\tfilename (a '-' dumps samples to stdout)\n\n"
+        "\tNote: options with * are only availale for the RSP2\n\n");
 	exit(1);
 }
 
@@ -108,44 +126,182 @@ static void sighandler(int signum)
 }
 #endif
 
+void gainCallback(unsigned int gRdB, unsigned int lnaGRdB, void *cbContext)
+{
+    return;
+}
+
+void streamCallback(short *xi, short *xq, unsigned int firstSampleNum,
+    int grChanged, int rfChanged, int fsChanged, unsigned int numSamples,
+    unsigned int reset, void *cbContext)
+{
+    if (outputRes == 16) {
+        buf16 = malloc(numSamples * 2 * sizeof(short));
+    } else {
+        buf8 = malloc(numSamples * 2 * sizeof(uint8_t));
+    }
+
+    int i = 0;
+    int j = 0;
+
+    for (i = 0; i < numSamples; i++) {
+        if (outputRes == 16) {
+            buf16[j++] = xi[i];
+            buf16[j++] = xq[i];
+        } else {
+            buf8[j++] = (unsigned char) (xi[i] >> 8);
+            buf8[j++] = (unsigned char) (xq[i] >> 8);
+        }
+    }
+
+    if (outputRes == 16) {
+        if (fwrite(buf16, sizeof(short), numSamples * 2, file) != (size_t) numSamples*2) {
+            fprintf(stderr, "Not enough samples received.\n");
+            return;
+        }
+    } else {
+        if (fwrite(buf8, sizeof(uint8_t), numSamples * 2, file) != (size_t) numSamples*2) {
+            fprintf(stderr, "Not enough samples received.\n");
+            return;
+        }
+    }
+}
+
+bool check_bw(int bwkHz) {
+
+    switch (bwkHz) {
+        case 200:
+        case 300:
+        case 600:
+        case 1536:
+        case 5000:
+        case 6000:
+        case 7000:
+        case 8000:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool check_if(int ifkHz) {
+
+    switch (ifkHz) {
+        case 0:
+        case 450:
+        case 1620:
+        case 2048:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool check_res(int res) {
+    switch (res) {
+        case 8:
+        case 16:
+            return true;
+        default:
+            return false;
+    }
+}
+
 int main(int argc, char **argv)
 {
 #ifndef _WIN32
 	struct sigaction sigact;
 #endif
 	char *filename = NULL;
-	int n_read;
 	mir_sdr_ErrT r;
     int opt;
-	int gain = 50;
-	FILE *file;
-	uint8_t *buffer;
 	uint32_t frequency = 100000000;
 	uint32_t samp_rate = DEFAULT_SAMPLE_RATE;
 	uint32_t out_block_size = DEFAULT_BUF_LENGTH;
-    int rspMode = 0;
     int rspLNA = 0;
-    int i, j;
+    int i;
+    int bwkHz = 1536;
+    int ifkHz = 0;
+    int device = 0;
+    int gainR = 50;
+    int notchEnable = 0;
+    int biasT = 0;
+    int antenna = 0; // 0 = Ant A, 1 = Ant B, 2 = HiZ
+    long setPoint = -30;
+    int refClk = 0;
+    mir_sdr_SetGrModeT grMode = mir_sdr_USE_SET_GR_ALT_MODE;
+    int gRdBsystem;
+    int verbose = 0;
+    float ppmOffset = 0.0;
+    mir_sdr_DeviceT devices[4];
+    unsigned int numDevs;
+    int devAvail = 0;
+    mir_sdr_RSPII_AntennaSelectT ant = mir_sdr_RSPII_ANTENNA_A;
+    int agcControl = 1;
 
-	while ((opt = getopt(argc, argv, "f:g:s:n:r:l")) != -1) {
+	while ((opt = getopt(argc, argv, "a:A:b:d:f:i:l:n:o:p:r:R:s:t:v:x:")) != -1) {
 		switch (opt) {
+        case 'a':
+            antenna = atoi(optarg);
+            break;
+        case 'A':
+            agcControl = atoi(optarg);
+            break;
+        case 'b':
+            bwkHz = atoi(optarg);
+            if (!check_bw(bwkHz)) {
+                fprintf(stderr, "\nERROR: IF bandwidth (%d kHz) not valid.\n", bwkHz);
+                fprintf(stderr, "Valid values: 200, 300, 600, 1536, 5000, 6000, 7000, 8000\n\n");
+                usage();
+            }
+            break;
+        case 'd':
+            device = atoi(optarg) - 1;
+            break;
 		case 'f':
 			frequency = (uint32_t)atofs(optarg);
 			break;
-		case 'g':
-			gain = (int)atof(optarg); 
+        case 'i':
+            ifkHz = atoi(optarg);
+            if (!check_if(ifkHz)) {
+                fprintf(stderr, "\nERROR: IF frequency (%d kHz) not valid.\n", ifkHz);
+                fprintf(stderr, "Valid values: 0, 450, 1620, 2048\n\n");
+                usage();
+            }
+            break;
+        case 'l':
+            rspLNA = atoi(optarg);
+            break;
+		case 'n':
+			notchEnable = atoi(optarg);
+			break;
+        case 'o':
+            ppmOffset = atof(optarg);
+            break;
+        case 'p':
+            setPoint = atol(optarg);
+            break;
+        case 'r':
+            refClk = atoi(optarg);
+            break;
+		case 'R':
+			gainR = atoi(optarg); 
 			break;
 		case 's':
 			samp_rate = (uint32_t)atofs(optarg);
 			break;
-		case 'n':
-			bytes_to_read = (uint32_t)atofs(optarg) * 2;
-			break;
-        case 'r':
-            rspMode = atoi(optarg);
+        case 't':
+            biasT = atoi(optarg);
             break;
-        case 'l':
-            rspLNA = atoi(optarg);
+        case 'v':
+            verbose = atoi(optarg);
+            break;
+        case 'x':
+            outputRes = atoi(optarg);
+            if (!check_res(outputRes)) {
+                fprintf(stderr, "\nERROR: Only 8 or 16 bit output supported.\n");
+                usage();
+            }
             break;
 		default:
 			usage();
@@ -170,15 +326,7 @@ int main(int argc, char **argv)
 		out_block_size = DEFAULT_BUF_LENGTH;
 	}
 
-	buffer = malloc(out_block_size * sizeof(uint8_t));
 
-	r = mir_sdr_Init(40, 2.0, 100.00, mir_sdr_BW_1_536, mir_sdr_IF_Zero,
-                        &samplesPerPacket);
-	if (r != mir_sdr_Success) {
-		fprintf(stderr, "Failed to open SDRplay RSP device.\n");
-		exit(1);
-	}
-    mir_sdr_Uninit();
 #ifndef _WIN32
 	sigact.sa_handler = sighandler;
 	sigemptyset(&sigact.sa_mask);
@@ -204,71 +352,89 @@ int main(int argc, char **argv)
 		}
 	}
 
-    if (rspMode == 1)
-    {
-        mir_sdr_SetParam(201,1);
-        if (rspLNA == 1)
-        {
-            mir_sdr_SetParam(202,0);
-        }
-        else
-        {
-            mir_sdr_SetParam(202,1);
-        }
-        r = mir_sdr_Init(gain, (samp_rate/1e6), (frequency/1e6),
-                       mir_sdr_BW_1_536, mir_sdr_IF_Zero, &samplesPerPacket );
+    if (verbose > 0) {
+        mir_sdr_DebugEnable(1);
     }
-    else
-    {
-        r = mir_sdr_Init((78-gain), (samp_rate/1e6), (frequency/1e6),
-                       mir_sdr_BW_1_536, mir_sdr_IF_Zero, &samplesPerPacket );
+
+    mir_sdr_GetDevices(&devices[0], &numDevs, 4);
+
+    for(i = 0; i < numDevs; i++) {
+        if(devices[i].devAvail == 1) {
+            devAvail++;
+        }
     }
+
+    if (devAvail == 0) {
+        fprintf(stderr, "ERROR: No RSP devices available.\n");
+        exit(1);
+    }
+
+    if (devices[device].devAvail != 1) {
+        fprintf(stderr, "ERROR: RSP selected (%d) is not available.\n", (device + 1));
+        exit(1);
+    }
+
+    mir_sdr_SetDeviceIdx(device);
+
+    devModel = devices[device].hwVer;
+
+    mir_sdr_SetPpm(ppmOffset);
+
+    if (devModel == 2) {
+        if (antenna == 1) {
+            ant = mir_sdr_RSPII_ANTENNA_A;
+            mir_sdr_RSPII_AntennaControl(ant);
+        } else {
+            ant = mir_sdr_RSPII_ANTENNA_B;
+            mir_sdr_RSPII_AntennaControl(ant);
+        }
+
+        if (antenna == 2) {
+            mir_sdr_AmPortSelect(1);
+        }
+    }
+
+    r = mir_sdr_StreamInit(&gainR, (samp_rate/1e6), (frequency/1e6),
+        (mir_sdr_Bw_MHzT)bwkHz, (mir_sdr_If_kHzT)ifkHz, rspLNA, &gRdBsystem,
+        grMode, &samplesPerPacket, streamCallback, gainCallback, &cbContext);
 
 	if (r != mir_sdr_Success) {
 		fprintf(stderr, "Failed to start SDRplay RSP device.\n");
+        fprintf(stderr, "Use -v 1 (for verbose mode) to see the issue.\n");
 		exit(1);
 	}
 
-    mir_sdr_SetDcMode(4,0);
-    mir_sdr_SetDcTrackTime(63);
+    mir_sdr_AgcControl(agcControl, setPoint, 0, 0, 0, 0, rspLNA);
 
-    ibuf = malloc(samplesPerPacket * sizeof(short));
-    qbuf = malloc(samplesPerPacket * sizeof(short));
+    if (devModel == 2) {
+        if (refClk > 0) {
+            mir_sdr_RSPII_ExternalReferenceControl(1);
+        } else {
+            mir_sdr_RSPII_ExternalReferenceControl(0);
+        }
 
-	fprintf(stderr, "Writing samples...\n");
+        if (notchEnable > 0) {
+            mir_sdr_RSPII_RfNotchEnable(1);
+        } else {
+            mir_sdr_RSPII_RfNotchEnable(0);
+        }
+
+        if (biasT > 0) {
+            mir_sdr_RSPII_BiasTControl(1);
+        } else {
+            mir_sdr_RSPII_BiasTControl(0);
+        }
+    }
+
+	fprintf(stderr, "Writing samples...");
+    if (verbose > 0) {
+        fprintf(stderr, "\n");
+    }
 	while (!do_exit) {
-		r = mir_sdr_ReadPacket(ibuf, qbuf, &firstSample, &grChanged, &rfChanged,
-                            &fsChanged);
-		if (r != mir_sdr_Success) {
-			fprintf(stderr, "WARNING: ReadPacket failed.\n");
-			break;
-		}
-
-        j = 0;
-        for (i=0; i < samplesPerPacket; i++)
-        {
-            buffer[j++] = (unsigned char) (ibuf[i] >> 8);
-            buffer[j++] = (unsigned char) (qbuf[i] >> 8);
+        if (verbose < 1) {
+            fprintf(stderr,".");
         }
-
-        n_read = (samplesPerPacket * 2);
-
-        if ((bytes_to_read > 0) && (bytes_to_read <= (uint32_t)n_read)) {
-            n_read = bytes_to_read;
-            do_exit = 1;
-        }
-
-        if (fwrite(buffer, 1, n_read, file) != (size_t)n_read) {
-            fprintf(stderr, "Short write, samples lost, exiting!\n"); break;
-		}
-
-		if ((uint32_t)n_read < out_block_size) {
-			fprintf(stderr, "Short read, samples lost, exiting!\n");
-			break;
-		}
-
-		if (bytes_to_read > 0)
-			bytes_to_read -= n_read;
+        sleep(1);
 	}
 
 	if (do_exit)
@@ -279,8 +445,14 @@ int main(int argc, char **argv)
 	if (file != stdout)
 		fclose(file);
 
-	mir_sdr_Uninit();
-	free (buffer);
-out:
-	return r >= 0 ? r : -r;
+	mir_sdr_StreamUninit();
+
+    if (outputRes == 16) {
+	    free (buf16);
+    } else {
+        free (buf8);
+    }
+
+    out:
+    return r >= 0 ? r : -r;
 }
