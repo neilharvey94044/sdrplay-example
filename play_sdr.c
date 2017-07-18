@@ -46,8 +46,6 @@ static int do_exit = 0;
 void *cbContext = NULL;
 
 FILE *file;
-uint8_t *buf8;
-short *buf16;
 unsigned int firstSample;
 int samplesPerPacket, grChanged, fsChanged, rfChanged;
 int devModel = 1;
@@ -135,6 +133,9 @@ void streamCallback(short *xi, short *xq, unsigned int firstSampleNum,
     int grChanged, int rfChanged, int fsChanged, unsigned int numSamples,
     unsigned int reset, void *cbContext)
 {
+    uint8_t *buf8;
+    short *buf16;
+	
     if (outputRes == 16) {
         buf16 = malloc(numSamples * 2 * sizeof(short));
     } else {
@@ -157,13 +158,21 @@ void streamCallback(short *xi, short *xq, unsigned int firstSampleNum,
     if (outputRes == 16) {
         if (fwrite(buf16, sizeof(short), numSamples * 2, file) != (size_t) numSamples*2) {
             fprintf(stderr, "Not enough samples received.\n");
+	    free(buf16);
             return;
         }
     } else {
         if (fwrite(buf8, sizeof(uint8_t), numSamples * 2, file) != (size_t) numSamples*2) {
             fprintf(stderr, "Not enough samples received.\n");
+	    free(buf8);
             return;
         }
+    }
+
+    if (outputRes == 16) {
+        free(buf16);
+    } else {
+        free(buf8);
     }
 }
 
@@ -384,15 +393,20 @@ int main(int argc, char **argv)
         if (antenna == 1) {
             ant = mir_sdr_RSPII_ANTENNA_A;
             mir_sdr_RSPII_AntennaControl(ant);
+            mir_sdr_AmPortSelect(0);
         } else {
             ant = mir_sdr_RSPII_ANTENNA_B;
             mir_sdr_RSPII_AntennaControl(ant);
+            mir_sdr_AmPortSelect(0);
         }
 
         if (antenna == 2) {
             mir_sdr_AmPortSelect(1);
         }
     }
+	
+    grMode = mir_sdr_USE_RSP_SET_GR;
+    if(devModel == 1) grMode = mir_sdr_USE_SET_GR_ALT_MODE;
 
     r = mir_sdr_StreamInit(&gainR, (samp_rate/1e6), (frequency/1e6),
         (mir_sdr_Bw_MHzT)bwkHz, (mir_sdr_If_kHzT)ifkHz, rspLNA, &gRdBsystem,
@@ -448,12 +462,6 @@ int main(int argc, char **argv)
 	mir_sdr_StreamUninit();
 
     mir_sdr_ReleaseDeviceIdx();
-
-    if (outputRes == 16) {
-	    free (buf16);
-    } else {
-        free (buf8);
-    }
 
     out:
     return r >= 0 ? r : -r;
