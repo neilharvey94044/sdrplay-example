@@ -131,7 +131,7 @@ void gainCallback(unsigned int gRdB, unsigned int lnaGRdB, void *cbContext)
 
 void streamCallback(short *xi, short *xq, unsigned int firstSampleNum,
     int grChanged, int rfChanged, int fsChanged, unsigned int numSamples,
-    unsigned int reset, void *cbContext)
+    unsigned int reset, unsigned int hwRemoved, void *cbContext)
 {
     uint8_t *buf8;
     short *buf16;
